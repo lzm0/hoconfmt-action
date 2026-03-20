@@ -1,0 +1,102 @@
+name: hoconfmt PR comment formatter
+description: Format changed .conf files on an internal pull request and push the result back to the PR branch.
+
+inputs:
+  formatter-version:
+    description: hoconfmt release tag
+    required: false
+    default: v0.1.3
+  formatter-repo:
+    description: Repo that publishes hoconfmt release assets
+    required: false
+    default: lzm0/hoconfmt
+  file-glob:
+    description: Git pathspec of files to format
+    required: false
+    default: '*.conf'
+
+runs:
+  using: composite
+  steps:
+    - name: Load PR metadata
+      id: pr
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.issue.number }}
+        COMMENTER: ${{ github.event.comment.user.login }}
+      run: |
+        set -euo pipefail
+
+        IFS=$'\t' read -r pr_author head_repo head_ref head_sha base_sha < <(
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" \
+            --jq '[.user.login, .head.repo.full_name, .head.ref, .head.sha, .base.sha] | @tsv'
+        )
+
+        if [ "$COMMENTER" != "$pr_author" ] || [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        {
+          echo "skip=false"
+          echo "head_repo=$head_repo"
+          echo "head_ref=$head_ref"
+          echo "head_sha=$head_sha"
+          echo "base_sha=$base_sha"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Check out PR branch
+      if: steps.pr.outputs.skip == 'false'
+      uses: actions/checkout@v6
+      with:
+        repository: ${{ steps.pr.outputs.head_repo }}
+        ref: ${{ steps.pr.outputs.head_ref }}
+        fetch-depth: 0
+
+    - name: Download hoconfmt
+      if: steps.pr.outputs.skip == 'false'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        FORMATTER_REPO: ${{ inputs.formatter-repo }}
+        VERSION: ${{ inputs.formatter-version }}
+      run: |
+        set -euo pipefail
+
+        asset="hoconfmt-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+        dir="$RUNNER_TEMP/hoconfmt"
+        mkdir -p "$dir"
+
+        gh release download "$VERSION" \
+          --repo "$FORMATTER_REPO" \
+          --pattern "$asset" \
+          --dir "$dir"
+
+        tar -xzf "$dir/$asset" -C "$dir"
+        chmod +x "$dir/hoconfmt"
+
+    - name: Format changed files
+      if: steps.pr.outputs.skip == 'false'
+      shell: bash
+      env:
+        BASE_SHA: ${{ steps.pr.outputs.base_sha }}
+        HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+        FILE_GLOB: ${{ inputs.file-glob }}
+      run: |
+        set -euo pipefail
+
+        dir="$RUNNER_TEMP/hoconfmt"
+        mapfile -t files < <(git diff --name-only --diff-filter=ACMRT "${BASE_SHA}...${HEAD_SHA}" -- "${FILE_GLOB}")
+        ((${#files[@]})) || exit 0
+
+        "$dir/hoconfmt" --write "${files[@]}"
+
+        git diff --quiet -- "${files[@]}" && exit 0
+
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -- "${files[@]}"
+        git commit -m "style: format HOCON files"
+        git push origin "HEAD:${HEAD_REF}"
